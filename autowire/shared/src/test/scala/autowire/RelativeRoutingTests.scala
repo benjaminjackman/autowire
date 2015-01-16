@@ -6,6 +6,8 @@ import utest.ExecutionContext.RunNow
 import upickle._
 import acyclic.file
 
+import scala.concurrent.Future
+
 
 object RelativeRoutingTests extends TestSuite {
  import utest.PlatformShims.await
@@ -26,10 +28,14 @@ object RelativeRoutingTests extends TestSuite {
 
       trait TableApi {
         def getHand(playerName: String): Seq[String]
+        val hand : HandApi
+      }
+      trait HandApi {
+        def foo() : Future[String]
       }
       // server-side implementation, and router
       class MyApiImpl(c: String) extends MagicalApi {
-        override def resetGame(): Seq[String] = ???
+        override def resetGame(): Seq[String] = Nil
         override val table: TableApi = new TableApi {
           override def getHand(playerId: String): Seq[String] = {
             if (playerId == "Ben") {
@@ -38,9 +44,14 @@ object RelativeRoutingTests extends TestSuite {
               Nil
             }
           }
+          override val hand: HandApi = new HandApi {
+            override def foo(): Future[String] = Future.successful("fooCall")
+          }
         }
         override def shuffle(x: Int, s: String, d: String = "Foo"): String = x + ":" + s + ":" + d
       }
+
+
 
 
       trait UPickleSerializers extends Serializers[String, upickle.Reader, upickle.Writer] {
@@ -76,6 +87,24 @@ object RelativeRoutingTests extends TestSuite {
 
       verifyClient(MyClient)
       verifyClient(MyClientIn)
+
+      locally {
+        val a = await(MyClientIn.subProxy[MagicalApi, HandApi](_.table.hand).foo().call())
+        assert("fooCall" == a)
+      }
+
+      locally {
+        val hapi = MyClientIn.autoProxy[MagicalApi, HandApi](_.table.hand)
+        val a = await(hapi.foo())
+        assert("fooCall" == a)
+      }
+//
+//      locally {
+//        val tapi = MyClientIn.autoProxy[MagicalApi, TableApi](_.table)
+//        val a = await(tapi.getHand("Bad"))
+//        assert("fooCall" == a)
+//      }
+
 
     }
   }

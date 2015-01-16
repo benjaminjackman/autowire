@@ -3,7 +3,7 @@ package autowire
 import scala.concurrent.Future
 import scala.reflect.macros.Context
 import language.experimental.macros
-import acyclic.file
+//import acyclic.file
 
 import Core._
 
@@ -34,11 +34,11 @@ object Macros {
       else q"scala.concurrent.Future.successful($t)"
     }
 
-    def getValsOrMeths(curCls: Type): Iterable[Either[(c.Symbol, MethodSymbol), (c.Symbol, MethodSymbol)]] = {
+    def extractableMembers(curCls: Type) = {
       def isAMemberOfAnyRef(member: Symbol) = weakTypeOf[AnyRef].members.exists(_.name == member.name)
       val membersOfBaseAndParents: Iterable[Symbol] = curCls.declarations ++ curCls.baseClasses.map(_.asClass.toType.declarations).flatten
-      val extractableMembers = for {
-        member <- membersOfBaseAndParents
+      for {
+        member <- membersOfBaseAndParents.toList.distinct
         if !isAMemberOfAnyRef(member)
         if !member.isSynthetic
         if member.isPublic
@@ -48,8 +48,10 @@ object Macros {
       } yield {
         member -> memTerm.asMethod
       }
+    }
 
-      extractableMembers flatMap { case (member, memTerm) =>
+    def getValsOrMeths(curCls: Type): Iterable[Either[(c.Symbol, MethodSymbol), (c.Symbol, MethodSymbol)]] = {
+      extractableMembers(curCls) flatMap { case (member, memTerm) =>
         if (memTerm.isGetter) {
           //This is a val (or a var-getter) so we will need to recur here
           Seq(Left(member -> memTerm))
@@ -139,7 +141,7 @@ object Macros {
       outerPath: Seq[String],
       innerPath: Seq[String],
       innerPathOnly: Boolean
-    ): Iterable[c.universe.Tree] = {
+      ): Iterable[c.universe.Tree] = {
       //See http://stackoverflow.com/questions/15786917/cant-get-inherited-vals-with-scala-reflection
       //Yep case law to program WUNDERBAR!
       getValsOrMeths(curCls).flatMap {
@@ -168,11 +170,119 @@ object Macros {
 
   }
 
+  def subProxy[Trait, SubTrait, PickleType, Reader[_], Writer[_]]
+  (c: Context)
+    (path: c.Expr[Trait => SubTrait])
+    (implicit strt: c.WeakTypeTag[SubTrait],
+      pt: c.WeakTypeTag[PickleType],
+      rt: c.WeakTypeTag[Reader[_]],
+      wt: c.WeakTypeTag[Writer[_]]
+      )
+  :
+  c.Expr[ClientProxy[SubTrait, PickleType, Reader, Writer]] = {
+
+    import c.universe._
+
+    val pathElems = {
+      def getMempath(tree: Tree, path: List[String]): List[String] = {
+        tree match {
+          case Select(t, n) =>
+            getMempath(t, n.toTermName.toString :: path)
+          case _ =>
+            path
+        }
+      }
+
+      getMempath(path.tree.children(1), Nil)
+    }
+
+    val res = q"""new autowire.ClientProxy[$strt, $pt, ${rt.tpe.typeConstructor}, ${wt.tpe.typeConstructor}](${c.prefix}, $pathElems)"""
+    c.Expr(res)
+  }
+
+  def autoProxy[Trait, SubTrait, PickleType, Reader[_], Writer[_]]
+  (c: Context)
+    (path: c.Expr[Trait => SubTrait])
+    (implicit
+      trt: c.WeakTypeTag[Trait],
+      strt: c.WeakTypeTag[SubTrait],
+      pt: c.WeakTypeTag[PickleType],
+      rt: c.WeakTypeTag[Reader[_]],
+      wt: c.WeakTypeTag[Writer[_]]
+      )
+  :
+  c.Expr[SubTrait] = {
+    import c.universe._
+
+    val help = new MacroHelp[c.type](c)
+
+    val pathElems = {
+      def getMempath(tree: Tree, path: List[String]): List[String] = {
+        tree match {
+          case Select(t, n) =>
+            getMempath(t, n.toTermName.toString :: path)
+          case _ =>
+            path
+        }
+      }
+
+      getMempath(path.tree.children(1), Nil)
+    }
+
+
+    val mems = help.getValsOrMeths(strt.tpe)
+
+    val meths = mems.map {
+      case Left((s, vs)) =>
+        c.abort(c.enclosingPosition, "Autoproxying of vals not yet supported!")
+      case Right((s, ms)) =>
+
+        val vparamss = ms.paramss.map(_.map {
+          paramSymbol => ValDef(
+            Modifiers(Flag.PARAM, tpnme.EMPTY, List()),
+            paramSymbol.name.toTermName,
+            TypeTree(paramSymbol.typeSignature),
+            EmptyTree)
+        })
+
+        val flattenedArgLists = ms.paramss.flatten
+
+        val nameNames: Seq[TermName] = flattenedArgLists.map(x => x.name.toTermName)
+        val memSel = (pathElems:+ms.name.toString).foldLeft(q"${c.prefix}[$trt]") { (cur, nex) =>
+          q"$cur.${c.universe.newTermName(nex)}"
+        }
+
+        val body = q"$memSel(..$nameNames).call()"
+
+        if (!ms.returnType.toString.contains("scala.concurrent.Future")) {
+          c.abort(c.enclosingPosition, s"All methods in autoproxied traits must return Futures! $ms did not")
+        }
+
+        DefDef(
+          Modifiers(),
+          s.name.toTermName,
+          Nil,
+          vparamss,
+          tq"${ms.returnType}",
+         body
+        )
+    }.toList
+
+    val res = q"""{
+      import autowire._
+      new $strt {
+        ..$meths
+      }
+    }
+    """
+
+    c.Expr(res)
+  }
 
   def clientMacro[Result]
-    (c: Context)
-      ()
-      (implicit r: c.WeakTypeTag[Result])
+  (c: Context)
+    ()
+    (implicit r: c.WeakTypeTag[Result])
   : c.Expr[Future[Result]] = {
 
     import c.universe._
@@ -282,7 +392,7 @@ object Macros {
       q"""{
         ..$prelude;
         $proxy.self.doCall(
-          autowire.Core.Request(Seq(..$outerPath), Seq(..$innerPath), Map(..$pickled))
+          autowire.Core.Request(Seq(..$outerPath), $proxy.prefixPath ++ Seq(..$innerPath), Map(..$pickled))
         ).map($proxy.self.read[${r}](_))
       }"""
     }
@@ -294,9 +404,9 @@ object Macros {
   }
 
   private def routeMacroCommon[Trait, PickleType, C <: Context]
-    (c: C)
-      (target: c.Expr[Trait], innerPathOnly: Boolean)
-      (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
+  (c: C)
+    (target: c.Expr[Trait], innerPathOnly: Boolean)
+    (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
   : c.Expr[Router[PickleType]] = {
     import c.universe._
     val help = new MacroHelp[c.type](c)
@@ -316,17 +426,17 @@ object Macros {
   }
 
   def routeMacro[Trait, PickleType]
-    (c: Context)
-      (target: c.Expr[Trait])
-      (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
+  (c: Context)
+    (target: c.Expr[Trait])
+    (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
   : c.Expr[Router[PickleType]] = {
     routeMacroCommon[Trait, PickleType, c.type](c)(target, innerPathOnly = false)
   }
 
   def innerRouteMacro[Trait, PickleType]
-    (c: Context)
-      (target: c.Expr[Trait])
-      (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
+  (c: Context)
+    (target: c.Expr[Trait])
+    (implicit t: c.WeakTypeTag[Trait], pt: c.WeakTypeTag[PickleType])
   : c.Expr[Router[PickleType]] = {
     routeMacroCommon[Trait, PickleType, c.type](c)(target, innerPathOnly = true)
   }

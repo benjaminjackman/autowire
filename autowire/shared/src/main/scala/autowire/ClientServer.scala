@@ -16,7 +16,16 @@ trait Client[PickleType, Reader[_], Writer[_]] extends Serializers[PickleType, R
    * @tparam Trait The interface that this autowire client makes its requests
    *               against.
    */
-  def apply[Trait] = ClientProxy[Trait, PickleType, Reader, Writer](this)
+  def apply[Trait] = ClientProxy[Trait, PickleType, Reader, Writer](this, Nil)
+
+  //Allows passing around a link to a nested api, that will still use the path of the full outer api
+  def subProxy[Trait, SubTrait](path: Trait => SubTrait): ClientProxy[SubTrait, PickleType, Reader, Writer] =
+    macro Macros.subProxy[Trait, SubTrait, PickleType, Reader, Writer]
+
+  //Allocates a new instance of the SubTrait where every method is implemented with a forward
+  //that calls through this client to the top level api. Tbis requires that the sub api has all it's defs
+  //return futures and any further nested apis from its val do as well.
+  def autoProxy[Trait, SubTrait](path: Trait => SubTrait): SubTrait = macro Macros.autoProxy[Trait, SubTrait, PickleType, Reader, Writer]
 
   /**
    * A method for you to override, that actually performs the heavy
@@ -32,11 +41,9 @@ trait Client[PickleType, Reader[_], Writer[_]] extends Serializers[PickleType, R
  * followed by a `.call()` call) will turn into an RPC using the original
  * [[Client]]
  */
-case class ClientProxy[Trait,
-                       PickleType,
-                       Reader[_],
-                       Writer[_]]
-                      (self: Client[PickleType, Reader, Writer])
+case class ClientProxy[Trait, PickleType, Reader[_], Writer[_]](
+  self: Client[PickleType, Reader, Writer],
+  prefixPath: Seq[String])
 
 trait Server[PickleType, Reader[_], Writer[_]] extends Serializers[PickleType, Reader, Writer] {
   type Request = Core.Request[PickleType]
